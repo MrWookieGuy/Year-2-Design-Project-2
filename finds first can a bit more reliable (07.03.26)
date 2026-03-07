@@ -1,0 +1,247 @@
+/* =========================================================================
+ * INTERPLANETARY ROBOT - SMOOTH PRECISION GRIP
+ * Task: 50cm Dash -> Dampened/Smooth Hunt -> Precision Grab
+ * ========================================================================= */
+
+#include <Wire.h>
+#include <MobaTools.h>
+
+// ==========================================
+// 1. PIN & ADDRESS DEFINITIONS
+// ==========================================
+#define MD25ADDRESS 0x58
+#define SPEED1 (byte)0x00
+#define SPEED2 0x01
+#define RESETENCODERS 0x10
+#define MODESELECTOR 0xF
+
+#define trigLeft 3            
+#define echoLeft 2            
+#define trigRight 9           
+#define echoRight 8           
+#define SERVO_PIN 10          
+
+// ==========================================
+// 2. TUNING CONSTANTS
+// ==========================================
+const int STOP              = 128; 
+const int DASH_SPEED        = 25;  
+const int SEARCH_BASE_SPEED = 15;  
+const int TURN_SPEED        = 14;  // Slightly faster turn to clear sensor noise
+
+const int SCAN_DIST         = 100; 
+const int HALT_DIST         = 20;  
+
+const float TICKS_PER_MM    = 1.0; 
+
+const int CLOSE_ANGLE       = 141;   
+const int OPEN_ANGLE        = 180;
+const int SERVO_SPEED       = 10; 
+
+// ==========================================
+// 3. OBJECTS & STATE MACHINE
+// ==========================================
+MoToServo gripperServo; 
+
+enum RobotState {
+  STATE_STARTUP,           
+  STATE_INITIAL_ADVANCE,   
+  STATE_SWEEP,             
+  STATE_APPROACH,          
+  STATE_PREP_GRIP,         
+  STATE_FINAL_INCHES,      
+  STATE_SECURE_CAN,        
+  STATE_COMPLETE           
+};
+
+RobotState currentState = STATE_STARTUP;
+
+void setup() {
+  Serial.begin(9600); 
+  Wire.begin();       
+
+  pinMode(trigLeft,  OUTPUT); pinMode(echoLeft,  INPUT);
+  pinMode(trigRight, OUTPUT); pinMode(echoRight, INPUT);
+
+  gripperServo.attach(SERVO_PIN);
+  gripperServo.setSpeed(SERVO_SPEED); 
+  
+  delay(2000);
+  slowServoMove(OPEN_ANGLE);
+  delay(500); 
+  slowServoMove(CLOSE_ANGLE);
+
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(MODESELECTOR); 
+  Wire.write(0);            
+  Wire.endTransmission();
+
+  encoderReset(); 
+  Serial.println("SYSTEM READY.");
+}
+
+void loop() {
+  switch (currentState) {
+    case STATE_STARTUP:
+      encoderReset();
+      delay(100); 
+      currentState = STATE_INITIAL_ADVANCE; 
+      break;
+
+    case STATE_INITIAL_ADVANCE:
+      if (driveDistance(700, DASH_SPEED)) { 
+        currentState = STATE_SWEEP; 
+      }
+      break;
+
+    case STATE_SWEEP:
+      set_speed(STOP + TURN_SPEED, STOP - TURN_SPEED);
+      if (checkForObject()) {
+        set_speed(STOP, STOP);
+        delay(500); 
+        currentState = STATE_APPROACH; 
+      }
+      break;
+
+    case STATE_APPROACH:
+      if (performDifferentialApproach()) {
+        set_speed(STOP, STOP);
+        encoderReset();
+        currentState = STATE_PREP_GRIP; 
+      }
+      break;
+
+    case STATE_PREP_GRIP:
+      delay(300); 
+      slowServoMove(OPEN_ANGLE);
+      delay(500); 
+      currentState = STATE_FINAL_INCHES;
+      break;
+
+    case STATE_FINAL_INCHES:
+      if (driveDistance(150, SEARCH_BASE_SPEED)) {
+        currentState = STATE_SECURE_CAN;
+      }
+      break;
+
+    case STATE_SECURE_CAN:
+      delay(300); 
+      slowServoMove(CLOSE_ANGLE);
+      delay(500); 
+      currentState = STATE_COMPLETE;
+      break;
+
+    case STATE_COMPLETE:
+      set_speed(STOP, STOP);
+      break;
+  }
+}
+
+// ==========================================
+// 6. HELPER FUNCTIONS
+// ==========================================
+
+void slowServoMove(int targetAngle) {
+  gripperServo.write(targetAngle); 
+  while (gripperServo.moving() > 0) {
+    delay(10); 
+  }
+}
+
+bool driveDistance(long distanceMM, int speed) {
+  long target = distanceMM * TICKS_PER_MM; 
+  if (abs(getEncoder()) < target) {
+    set_speed(STOP + speed, STOP + speed); 
+    return false;
+  } else {
+    set_speed(STOP, STOP); 
+    encoderReset();        
+    return true;  
+  }
+}
+
+bool checkForObject() {
+  int dL = readSensor(trigLeft, echoLeft); 
+  delay(20);                               
+  int dR = readSensor(trigRight, echoRight); 
+  if ((dL > 2 && dL < SCAN_DIST) || (dR > 2 && dR < SCAN_DIST)) {
+    return true; 
+  }
+  return false; 
+}
+
+bool performDifferentialApproach() {
+  int dL = readSensor(trigLeft, echoLeft);
+  delay(20); 
+  int dR = readSensor(trigRight, echoRight);
+
+  // Exit condition
+  if ((dL > 0 && dL <= HALT_DIST) || (dR > 0 && dR <= HALT_DIST)) {
+    return true; 
+  }
+
+  int error      = dL - dR;
+  int leftMotor  = SEARCH_BASE_SPEED;
+  int rightMotor = SEARCH_BASE_SPEED;
+
+  // DAMPENED STEERING LOGIC
+  if (dL > SCAN_DIST && dR < SCAN_DIST) {
+    // Only right sees it: gentle left turn
+    leftMotor  = SEARCH_BASE_SPEED + 4;
+    rightMotor = SEARCH_BASE_SPEED - 6;
+  } else if (dR > SCAN_DIST && dL < SCAN_DIST) {
+    // Only left sees it: gentle right turn
+    leftMotor  = SEARCH_BASE_SPEED - 6;
+    rightMotor = SEARCH_BASE_SPEED + 4;
+  } else if (dL < SCAN_DIST && dR < SCAN_DIST) {
+    // Both see it: Proportional steering with LOW gain (0.5)
+    // Constrain steering effect to avoid jitter
+    int steeringAdjust = constrain((int)(error * 0.3), -8, 8); 
+    leftMotor  = SEARCH_BASE_SPEED + steeringAdjust;
+    rightMotor = SEARCH_BASE_SPEED - steeringAdjust;
+  } else {
+    // Lost target: slow crawl
+    leftMotor  = SEARCH_BASE_SPEED - 3;
+    rightMotor = SEARCH_BASE_SPEED - 3;
+  }
+
+  set_speed(STOP + leftMotor, STOP + rightMotor);
+  return false; 
+}
+
+int readSensor(int trig, int echo) {
+  digitalWrite(trig, LOW);  delayMicroseconds(2);
+  digitalWrite(trig, HIGH); delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+  long duration = pulseIn(echo, HIGH, 30000);
+  if (duration == 0) return 999;
+  return duration * 0.034 / 2; 
+}
+
+void set_speed(int s1, int s2) {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(SPEED1); Wire.write(constrain(s1, 0, 255)); 
+  Wire.endTransmission();
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(SPEED2); Wire.write(constrain(s2, 0, 255));
+  Wire.endTransmission();
+}
+
+void encoderReset() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(RESETENCODERS); Wire.write(0x20); 
+  Wire.endTransmission();
+}
+
+long getEncoder() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(0x02); 
+  Wire.endTransmission();
+  Wire.requestFrom(MD25ADDRESS, 4);
+  if (Wire.available() < 4) return 0; 
+  long pos  = (long)Wire.read() << 24;
+  pos      += (long)Wire.read() << 16;
+  pos      += (long)Wire.read() << 8;
+  pos      += (long)Wire.read();
+  return pos;
+}
