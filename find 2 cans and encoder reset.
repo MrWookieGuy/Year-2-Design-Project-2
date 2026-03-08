@@ -1,0 +1,475 @@
+/* =========================================================================
+ * INTERPLANETARY ROBOT - MISSION PHASE 12 (ENCODER RECOVERY)
+ * ========================================================================= */
+
+#include <Wire.h>
+#include <MobaTools.h>
+
+// ==========================================
+// 1. PIN & ADDRESS DEFINITIONS
+// ==========================================
+#define MD25ADDRESS 0x58
+#define SPEED1 (byte)0x00
+#define SPEED2 0x01
+#define RESETENCODERS 0x10
+#define MODESELECTOR 0xF
+
+#define trigLeft 3             
+#define echoLeft 2             
+#define trigRight 9            
+#define echoRight 8            
+#define SERVO_PIN 10           
+
+// ==========================================
+// 2. TUNING CONSTANTS
+// ==========================================
+const int STOP              = 128; 
+const int DASH_SPEED        = 25;  
+const int SEARCH_BASE_SPEED = 15;  
+const int TURN_SPEED        = 18; 
+const int SCAN_SPEED        = 5;  
+const int REVERSE_SPEED     = 25; 
+
+const int SCAN_DIST         = 180; 
+const int HALT_DIST         = 22;  
+const int WALL_STOP_DIST    = 20;  
+
+const float TICKS_PER_MM    = 1.0; 
+const long TICKS_90_TURN    = 215; 
+
+const float Kp              = 0.3;  
+const int MAX_STEER_ADJUST  = 8;   
+
+const int CLOSE_ANGLE       = 110;   
+const int OPEN_ANGLE        = 180;
+const int SERVO_SPEED       = 10; 
+const int pauseSwitch       = 12;
+
+// ==========================================
+// 3. OBJECTS & STATE MACHINE
+// ==========================================
+MoToServo gripperServo; 
+
+// Track the total rotation of the robot using the difference between wheels
+long globalHeading = 0; 
+
+enum RobotState {
+  STATE_STARTUP,           
+  STATE_INITIAL_ADVANCE,   
+  STATE_SWEEP,             
+  STATE_APPROACH,          
+  STATE_PREP_GRIP,         
+  STATE_FINAL_INCHES,      
+  STATE_SECURE_CAN,        
+  STATE_POST_GRAB_ADVANCE, 
+  STATE_TURN_CW_INITIAL,   
+  STATE_REVERSE_INITIAL_WALL,   
+  STATE_DRIVE_OFF_WALL,    
+  STATE_TURN_ACW,          
+  STATE_DRIVE_TO_DROP,     
+  STATE_RELEASE_CAN,       
+  STATE_RETREAT,           
+  STATE_TURN_CW_RECENTRE,  
+  STATE_WALL_RECENTRE,     
+  STATE_MOVE_TO_YELLOW,    
+  STATE_CLOSE_FOR_HUNT,    
+  STATE_SWEEP_YELLOW,      
+  STATE_APPROACH_YELLOW,   
+  STATE_PREP_YELLOW_GRIP,  
+  STATE_FINAL_INCHES_YELLOW,
+  STATE_SECURE_YELLOW_CAN,  
+  STATE_ALIGN_STRAIGHT,     
+  STATE_COMPLETE           
+};
+
+RobotState currentState = STATE_STARTUP;
+
+void setup() {
+  Serial.begin(9600); 
+  Wire.begin();       
+
+  pinMode(trigLeft,  OUTPUT); pinMode(echoLeft,  INPUT);
+  pinMode(trigRight, OUTPUT); pinMode(echoRight, INPUT);
+  pinMode(pauseSwitch, INPUT_PULLUP);
+  
+  gripperServo.attach(SERVO_PIN);
+  gripperServo.setSpeed(SERVO_SPEED); 
+  
+  checkPause();
+  delay(2000);
+  slowServoMove(OPEN_ANGLE);
+  delay(500); 
+  slowServoMove(CLOSE_ANGLE);
+
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(MODESELECTOR); 
+  Wire.write(0);            
+  Wire.endTransmission();
+
+  resetEncodersAndClearHeading(); 
+  Serial.println("SYSTEM READY.");
+}
+
+void loop() {
+  checkPause();
+
+  switch (currentState) {
+    case STATE_STARTUP:
+      resetEncodersAndClearHeading();
+      delay(100); 
+      currentState = STATE_INITIAL_ADVANCE; 
+      break;
+
+    case STATE_INITIAL_ADVANCE:
+      if (driveDistance(700, DASH_SPEED)) currentState = STATE_SWEEP; 
+      break;
+
+    case STATE_SWEEP:
+      set_speed(STOP + TURN_SPEED, STOP - TURN_SPEED);
+      if (checkForObject()) {
+        set_speed(STOP, STOP);
+        delay(500); 
+        currentState = STATE_APPROACH; 
+      }
+      break;
+
+    case STATE_APPROACH:
+      if (performDifferentialApproach()) {
+        set_speed(STOP, STOP);
+        resetEncodersAndTrackHeading();
+        currentState = STATE_PREP_GRIP; 
+      }
+      break;
+
+    case STATE_PREP_GRIP:
+      delay(300); 
+      slowServoMove(OPEN_ANGLE);
+      delay(500); 
+      currentState = STATE_FINAL_INCHES;
+      break;
+
+    case STATE_FINAL_INCHES:
+      if (driveDistance(180, SEARCH_BASE_SPEED)) currentState = STATE_SECURE_CAN;
+      break;
+
+    case STATE_SECURE_CAN:
+      delay(300); 
+      slowServoMove(CLOSE_ANGLE);
+      delay(500); 
+      currentState = STATE_POST_GRAB_ADVANCE;
+      break;
+
+    case STATE_POST_GRAB_ADVANCE:
+      if (driveDistance(50, SEARCH_BASE_SPEED)) {
+        delay(100);
+        currentState = STATE_TURN_CW_INITIAL;
+      }
+      break;
+
+    case STATE_TURN_CW_INITIAL:
+      if (turnInPlace(TICKS_90_TURN, TURN_SPEED, true)) {
+        delay(100);
+        currentState = STATE_REVERSE_INITIAL_WALL;
+      }
+      break;
+
+    case STATE_REVERSE_INITIAL_WALL:
+      if (driveDistance(-500, REVERSE_SPEED)) {
+        delay(100);
+        currentState = STATE_DRIVE_OFF_WALL;
+      }
+      break;
+
+    case STATE_DRIVE_OFF_WALL:
+      if (driveDistance(100, SEARCH_BASE_SPEED)) {
+        delay(100);
+        currentState = STATE_TURN_ACW;
+      }
+      break;
+
+    case STATE_TURN_ACW:
+      if (turnInPlace(TICKS_90_TURN, TURN_SPEED, false)) {
+        delay(100);
+        currentState = STATE_DRIVE_TO_DROP;
+      }
+      break;
+
+    case STATE_DRIVE_TO_DROP: 
+    {
+      int distL = readSensor(trigLeft, echoLeft);
+      delay(20);
+      int distR = readSensor(trigRight, echoRight);
+      if ((distL > 0 && distL <= WALL_STOP_DIST) || (distR > 0 && distR <= WALL_STOP_DIST)) {
+        set_speed(STOP, STOP);
+        currentState = STATE_RELEASE_CAN;
+      } else {
+        set_speed(STOP + DASH_SPEED, STOP + DASH_SPEED);
+      }
+      break;
+    }
+
+    case STATE_RELEASE_CAN:
+      delay(500);
+      slowServoMove(OPEN_ANGLE);
+      delay(500);
+      resetEncodersAndTrackHeading();
+      currentState = STATE_RETREAT;
+      break;
+
+    case STATE_RETREAT:
+      if (driveDistance(-150, REVERSE_SPEED)) {
+        delay(100);
+        currentState = STATE_TURN_CW_RECENTRE;
+      }
+      break;
+
+    case STATE_TURN_CW_RECENTRE:
+      if (turnInPlace(TICKS_90_TURN, TURN_SPEED, true)) currentState = STATE_WALL_RECENTRE;
+      break;
+
+    case STATE_WALL_RECENTRE:
+      set_speed(STOP - REVERSE_SPEED, STOP - REVERSE_SPEED);
+      delay(6500); 
+      set_speed(STOP, STOP);
+      
+      // ZERO THE HEADING HERE. The wall is our perfectly straight reference point.
+      resetEncodersAndClearHeading(); 
+      currentState = STATE_MOVE_TO_YELLOW;
+      break;
+
+    case STATE_MOVE_TO_YELLOW:
+      if (driveDistance(150, SEARCH_BASE_SPEED)) {
+        currentState = STATE_CLOSE_FOR_HUNT;
+      }
+      break;
+
+    case STATE_CLOSE_FOR_HUNT:
+      slowServoMove(CLOSE_ANGLE);
+      delay(300);
+      currentState = STATE_SWEEP_YELLOW;
+      break;
+
+    case STATE_SWEEP_YELLOW:
+      set_speed(STOP + SCAN_SPEED, STOP - SCAN_SPEED);
+      if (checkForObject()) {
+        set_speed(STOP, STOP);
+        delay(500);
+        currentState = STATE_APPROACH_YELLOW;
+      } 
+      else if (abs(getEncoderL()) >= TICKS_90_TURN) {
+        set_speed(STOP, STOP);
+        resetEncodersAndTrackHeading();
+        currentState = STATE_COMPLETE;
+      }
+      break;
+
+    case STATE_APPROACH_YELLOW:
+      if (performDifferentialApproach()) {
+        set_speed(STOP, STOP);
+        
+        // This calculates exactly how much we deviated during the sweep + approach!
+        resetEncodersAndTrackHeading(); 
+        
+        Serial.print("Total heading drift captured: ");
+        Serial.println(globalHeading);
+        
+        currentState = STATE_PREP_YELLOW_GRIP;
+      }
+      break;
+
+    case STATE_PREP_YELLOW_GRIP:
+      delay(300);
+      slowServoMove(OPEN_ANGLE);
+      delay(500);
+      currentState = STATE_FINAL_INCHES_YELLOW;
+      break;
+
+    case STATE_FINAL_INCHES_YELLOW:
+      if (driveDistance(185, SEARCH_BASE_SPEED)) currentState = STATE_SECURE_YELLOW_CAN;
+      break;
+
+    case STATE_SECURE_YELLOW_CAN:
+      delay(300);
+      slowServoMove(CLOSE_ANGLE);
+      delay(500);
+      resetEncodersAndTrackHeading(); // Final check just in case driving straight drifted slightly
+      currentState = STATE_ALIGN_STRAIGHT;
+      break;
+
+    case STATE_ALIGN_STRAIGHT:
+    {
+      // If globalHeading is positive, we are angled right (CW). We need to turn left (CCW).
+      bool turnCW = (globalHeading < 0); 
+      long ticksToTurn = abs(globalHeading);
+
+      // If we are already extremely close to straight, just complete it
+      if (ticksToTurn < 10) {
+        Serial.println("Already straight enough. Complete.");
+        currentState = STATE_COMPLETE;
+      } 
+      // Otherwise, turn until we reverse the accumulated heading
+      else if (turnInPlace(ticksToTurn, TURN_SPEED, turnCW)) {
+        Serial.println("Robot is now facing straight again.");
+        currentState = STATE_COMPLETE;
+      }
+      break;
+    }
+
+    case STATE_COMPLETE:
+      set_speed(STOP, STOP);
+      break;
+  }
+}
+
+// ==========================================
+// 4. HELPER FUNCTIONS
+// ==========================================
+
+void slowServoMove(int targetAngle) {
+  gripperServo.write(targetAngle); 
+  while (gripperServo.moving() > 0) { 
+    checkPause();
+    delay(10); 
+  }
+}
+
+void checkPause() {
+  if (digitalRead(pauseSwitch) == LOW) {
+    set_speed(STOP, STOP); 
+    Serial.println("--- PAUSED ---");
+    while (digitalRead(pauseSwitch) == LOW) {
+      delay(10);
+    }
+    Serial.println("--- RESUMING ---");
+  }
+}
+
+bool driveDistance(long distanceMM, int speed) {
+  long target = abs(distanceMM * TICKS_PER_MM); 
+  if (abs(getEncoderL()) < target) {
+    if (distanceMM > 0) set_speed(STOP + speed, STOP + speed); 
+    else set_speed(STOP - speed, STOP - speed); 
+    return false;
+  } else {
+    set_speed(STOP, STOP); 
+    resetEncodersAndTrackHeading(); // Tracks any slight drift that happened during the drive        
+    return true;  
+  }
+}
+
+bool turnInPlace(long ticks, int speed, bool clockwise) {
+  if (abs(getEncoderL()) < ticks) {
+    if (clockwise) set_speed(STOP + speed, STOP - speed);
+    else set_speed(STOP - speed, STOP + speed);
+    return false;
+  } else {
+    set_speed(STOP, STOP);
+    resetEncodersAndTrackHeading(); // Updates heading based on the turn
+    return true;
+  }
+}
+
+bool checkForObject() {
+  int dL = readSensor(trigLeft, echoLeft); 
+  delay(20);                                
+  int dR = readSensor(trigRight, echoRight); 
+  return ((dL > 2 && dL < SCAN_DIST) || (dR > 2 && dR < SCAN_DIST));
+}
+
+bool performDifferentialApproach() {
+  int dL = readSensor(trigLeft, echoLeft);
+  delay(20); 
+  int dR = readSensor(trigRight, echoRight);
+  if ((dL > 0 && dL <= HALT_DIST) || (dR > 0 && dR <= HALT_DIST)) return true; 
+
+  int error = dL - dR;  
+  int leftMotor = SEARCH_BASE_SPEED, rightMotor = SEARCH_BASE_SPEED;
+
+  if (dL < SCAN_DIST && dR < SCAN_DIST) {
+    int steeringAdjust = constrain((int)(error * Kp), -MAX_STEER_ADJUST, MAX_STEER_ADJUST);
+    leftMotor += steeringAdjust; rightMotor -= steeringAdjust;
+  } else if (dL > SCAN_DIST && dR < SCAN_DIST) {
+    leftMotor = SEARCH_BASE_SPEED + 4; rightMotor = SEARCH_BASE_SPEED - 6;
+  } else if (dR > SCAN_DIST && dL < SCAN_DIST) {
+    leftMotor = SEARCH_BASE_SPEED - 6; rightMotor = SEARCH_BASE_SPEED + 4;
+  } else {
+    leftMotor = SEARCH_BASE_SPEED - 3; rightMotor = SEARCH_BASE_SPEED - 3;
+  }
+  set_speed(STOP + leftMotor, STOP + rightMotor);
+  return false; 
+}
+
+int readSensor(int trig, int echo) {
+  digitalWrite(trig, LOW);  delayMicroseconds(2);
+  digitalWrite(trig, HIGH); delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+  long duration = pulseIn(echo, HIGH, 30000);
+  if (duration == 0) return 999;
+  return duration * 0.034 / 2; 
+}
+
+void set_speed(int s1, int s2) {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(SPEED1); Wire.write(constrain(s1, 0, 255)); 
+  Wire.endTransmission();
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(SPEED2); Wire.write(constrain(s2, 0, 255));
+  Wire.endTransmission();
+}
+
+// ==========================================
+// 5. ENCODER TRACKING & MATH
+// ==========================================
+
+// Gets the Left Encoder (Register 0x02)
+long getEncoderL() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(0x02); 
+  Wire.endTransmission();
+  Wire.requestFrom(MD25ADDRESS, 4);
+  if (Wire.available() < 4) return 0; 
+  long pos = (long)Wire.read() << 24;
+  pos |= (long)Wire.read() << 16;
+  pos |= (long)Wire.read() << 8;
+  pos |= (long)Wire.read();
+  return pos;
+}
+
+// Gets the Right Encoder (Register 0x06)
+long getEncoderR() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(0x06); 
+  Wire.endTransmission();
+  Wire.requestFrom(MD25ADDRESS, 4);
+  if (Wire.available() < 4) return 0; 
+  long pos = (long)Wire.read() << 24;
+  pos |= (long)Wire.read() << 16;
+  pos |= (long)Wire.read() << 8;
+  pos |= (long)Wire.read();
+  return pos;
+}
+
+// Hardware reset only (used internally by the two functions below)
+void encoderReset() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(RESETENCODERS); Wire.write(0x20); 
+  Wire.endTransmission();
+}
+
+// Calculates how much the robot has turned, adds it to the global memory, THEN resets hardware
+void resetEncodersAndTrackHeading() {
+  long leftPos = getEncoderL();
+  long rightPos = getEncoderR();
+  
+  // Difference / 2 gives us the exact ticks of rotation
+  long headingChange = (leftPos - rightPos) / 2; 
+  globalHeading += headingChange;
+  
+  encoderReset();
+}
+
+// Completely zeros out everything. Used when facing a known straight wall.
+void resetEncodersAndClearHeading() {
+  encoderReset();
+  globalHeading = 0;
+}
