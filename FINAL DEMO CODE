@@ -1,0 +1,844 @@
+/* =========================================================================
+ * INTERPLANETARY ROBOT - MISSION PHASE 12 (ENCODER RECOVERY)
+ * ========================================================================= */
+
+#include <Wire.h>
+#include <MobaTools.h>
+
+// ==========================================
+// 1. PIN & ADDRESS DEFINITIONS
+// ==========================================
+#define MD25ADDRESS 0x58
+#define SPEED1 (byte)0x00
+#define SPEED2 0x01
+#define RESETENCODERS 0x10
+#define MODESELECTOR 0xF
+
+#define trigLeft 3             
+#define echoLeft 2             
+#define trigRight 9            
+#define echoRight 8            
+#define SERVO_PIN 10           
+
+// ==========================================
+// 2. TUNING CONSTANTS
+// ==========================================
+const int STOP              = 128; 
+const int DASH_SPEED        = 30;  
+const int SEARCH_BASE_SPEED = 20;  
+const int TURN_SPEED        = 18; 
+const int SCAN_SPEED        = 5;  
+const int REVERSE_SPEED     = 35; 
+
+const int SCAN_DIST         = 180; 
+const int HALT_DIST         = 25;  
+const int WALL_STOP_DIST    = 20;  
+
+const float TICKS_PER_MM    = 1.0; 
+const long TICKS_90_TURN    = 220; 
+const long TICKS_2_DEG      = 5;   // NEW: ~2 degrees worth of encoder ticks
+
+const float Kp              = 0.5;  
+const int MAX_STEER_ADJUST  = 8;   
+
+const int CLOSE_ANGLE       = 110;   
+const int OPEN_ANGLE        = 180;
+const int SERVO_SPEED       = 10; 
+const int pauseSwitch       = 12;
+
+// ==========================================
+// 3. OBJECTS & STATE MACHINE
+// ==========================================
+MoToServo gripperServo; 
+
+// Track the total rotation of the robot using the difference between wheels
+long globalHeading = 0; 
+
+enum RobotState {
+  STATE_STARTUP,           
+  STATE_INITIAL_ADVANCE,   
+  STATE_SWEEP,             
+  STATE_APPROACH,          
+  STATE_HALT_ADJUST,       // NEW: 2-degree turn state
+  STATE_PREP_GRIP,         
+  STATE_FINAL_INCHES,      
+  STATE_SECURE_CAN,        
+  STATE_POST_GRAB_ADVANCE, 
+  STATE_TURN_CW_INITIAL,   
+  STATE_REVERSE_INITIAL_WALL,   
+  STATE_DRIVE_OFF_WALL,    
+  STATE_TURN_ACW,          
+  STATE_DRIVE_TO_DROP,     
+  STATE_RELEASE_CAN,       
+  STATE_RETREAT,           
+  STATE_TURN_CW_RECENTRE,  
+  STATE_WALL_RECENTRE,     
+  STATE_MOVE_TO_YELLOW,    
+  STATE_CLOSE_FOR_HUNT,    
+  STATE_SWEEP_YELLOW,      
+  STATE_APPROACH_YELLOW,   
+  STATE_HALT_ADJUST_YELLOW,// NEW: 2-degree turn state
+  STATE_PREP_YELLOW_GRIP,  
+  STATE_FINAL_INCHES_YELLOW,
+  STATE_SECURE_YELLOW_CAN,  
+  STATE_ALIGN_STRAIGHT,
+  STATE_TURN_180_CW,       
+  STATE_DRIVE_TO_WALL,     
+  STATE_TURN_180_CW_FINAL, 
+  STATE_REVERSE_FINAL,
+  STATE_FORWARD_10CM,        
+  STATE_TURN_90_CCW,         
+  STATE_DRIVE_TO_WALL_FINAL, 
+  STATE_PUSH_10CM,           
+  STATE_RELEASE_FINAL_CAN,   
+  STATE_RETREAT_FINAL,       
+  STATE_TURN_90_CW_FINAL,      
+  STATE_REVERSE_TO_WALL_FINAL, 
+  STATE_FORWARD_10CM_FINAL,    
+  STATE_TURN_90_CW_AGAIN,      
+  STATE_FORWARD_110CM,         
+  STATE_TURN_90_CCW_AGAIN,     
+  STATE_PREP_FINAL_HUNT,       
+  STATE_SWEEP_FINAL,           
+  STATE_APPROACH_FINAL,        
+  STATE_HALT_ADJUST_FINAL, // NEW: 2-degree turn state
+  STATE_PREP_FINAL_GRIP,       
+  STATE_FINAL_INCHES_FINAL,    
+  STATE_SECURE_FINAL_CAN,      
+  STATE_ALIGN_STRAIGHT_FINAL,  
+  STATE_FINAL_TURN_90_CCW_1,   
+  STATE_FINAL_FORWARD_30CM,    
+  STATE_FINAL_TURN_90_CCW_2,   
+  STATE_FINAL_DRIVE_TO_WALL,   
+  STATE_FINAL_TURN_180_2,      
+  STATE_FINAL_SQUARE_UP_WALL,  
+  STATE_FINAL_FORWARD_10CM,        
+  STATE_FINAL_TURN_90_CCW,         
+  STATE_FINAL_DRIVE_TO_DROP_WALL, 
+  STATE_FINAL_PUSH_5CM,            
+  STATE_FINAL_RELEASE_CAN,         
+  STATE_FINAL_REVERSE_10CM,        
+  STATE_COMPLETE           
+};
+
+RobotState currentState = STATE_STARTUP;
+
+void setup() {
+  Serial.begin(9600); 
+  Wire.begin();        
+
+  pinMode(trigLeft,  OUTPUT); pinMode(echoLeft,  INPUT);
+  pinMode(trigRight, OUTPUT); pinMode(echoRight, INPUT);
+  pinMode(pauseSwitch, INPUT_PULLUP);
+  
+  gripperServo.attach(SERVO_PIN);
+  gripperServo.setSpeed(SERVO_SPEED); 
+  
+  checkPause();
+  delay(2000);
+  slowServoMove(OPEN_ANGLE);
+  delay(500); 
+  slowServoMove(CLOSE_ANGLE);
+
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(MODESELECTOR); 
+  Wire.write(0);            
+  Wire.endTransmission();
+
+  resetEncodersAndClearHeading(); 
+  Serial.println("SYSTEM READY.");
+}
+
+void loop() {
+  checkPause();
+
+  switch (currentState) {
+    case STATE_STARTUP:
+      resetEncodersAndClearHeading();
+      delay(100); 
+      currentState = STATE_INITIAL_ADVANCE; 
+      break;
+
+    case STATE_INITIAL_ADVANCE:
+      if (driveDistance(700, DASH_SPEED)) currentState = STATE_SWEEP; 
+      break;
+
+    case STATE_SWEEP:
+      set_speed(STOP + TURN_SPEED, STOP - TURN_SPEED);
+      if (checkForObject()) {
+        set_speed(STOP, STOP);
+        delay(500); 
+        currentState = STATE_APPROACH; 
+      }
+      break;
+
+    case STATE_APPROACH:
+      if (performDifferentialApproach()) {
+        set_speed(STOP, STOP);
+        resetEncodersAndTrackHeading();
+        currentState = STATE_HALT_ADJUST; // UPDATED TRANSITION
+      }
+      break;
+
+    // --- NEW: 2-DEGREE TWEAK AFTER HUNT 1 ---
+    case STATE_HALT_ADJUST:
+      if (turnInPlace(TICKS_2_DEG, TURN_SPEED, true)) { // true = CW
+        currentState = STATE_PREP_GRIP;
+      }
+      break;
+
+    case STATE_PREP_GRIP:
+      delay(300); 
+      slowServoMove(OPEN_ANGLE);
+      delay(500); 
+      currentState = STATE_FINAL_INCHES;
+      break;
+
+    case STATE_FINAL_INCHES:
+      if (driveDistance(280, SEARCH_BASE_SPEED)) currentState = STATE_SECURE_CAN;
+      break;
+
+    case STATE_SECURE_CAN:
+      delay(300); 
+      slowServoMove(CLOSE_ANGLE);
+      delay(500); 
+      currentState = STATE_POST_GRAB_ADVANCE;
+      break;
+
+    case STATE_POST_GRAB_ADVANCE:
+      if (driveDistance(50, SEARCH_BASE_SPEED)) {
+        delay(100);
+        currentState = STATE_TURN_CW_INITIAL;
+      }
+      break;
+
+    case STATE_TURN_CW_INITIAL:
+      if (turnInPlace(TICKS_90_TURN, TURN_SPEED, true)) {
+        delay(100);
+        currentState = STATE_REVERSE_INITIAL_WALL;
+      }
+      break;
+
+    case STATE_REVERSE_INITIAL_WALL:
+      if (driveDistance(-600, REVERSE_SPEED)) {
+        delay(100);
+        currentState = STATE_DRIVE_OFF_WALL;
+      }
+      break;
+
+    case STATE_DRIVE_OFF_WALL:
+      if (driveDistance(100, SEARCH_BASE_SPEED)) {
+        delay(100);
+        currentState = STATE_TURN_ACW;
+      }
+      break;
+
+    case STATE_TURN_ACW:
+      if (turnInPlace(TICKS_90_TURN + 8, TURN_SPEED, false)) {
+        delay(100);
+        currentState = STATE_DRIVE_TO_DROP;
+      }
+      break;
+
+    case STATE_DRIVE_TO_DROP: 
+    {
+      int distL = readSensor(trigLeft, echoLeft);
+      delay(20);
+      int distR = readSensor(trigRight, echoRight);
+      if ((distL > 0 && distL <= WALL_STOP_DIST) || (distR > 0 && distR <= WALL_STOP_DIST)) {
+        set_speed(STOP, STOP);
+        currentState = STATE_RELEASE_CAN;
+      } else {
+        set_speed(STOP + DASH_SPEED, STOP + DASH_SPEED);
+      }
+      break;
+    }
+
+    case STATE_RELEASE_CAN:
+      delay(500);
+      slowServoMove(OPEN_ANGLE);
+      delay(500);
+      resetEncodersAndTrackHeading();
+      currentState = STATE_RETREAT;
+      break;
+
+    case STATE_RETREAT:
+      if (driveDistance(-150, REVERSE_SPEED)) {
+        delay(100);
+        currentState = STATE_TURN_CW_RECENTRE;
+      }
+      break;
+
+    case STATE_TURN_CW_RECENTRE:
+      if (turnInPlace(TICKS_90_TURN, TURN_SPEED, true)) currentState = STATE_WALL_RECENTRE;
+      break;
+
+    case STATE_WALL_RECENTRE:
+      set_speed(STOP - REVERSE_SPEED, STOP - REVERSE_SPEED);
+      delay(2500); 
+      set_speed(STOP, STOP);
+      
+      resetEncodersAndClearHeading(); 
+      currentState = STATE_MOVE_TO_YELLOW;
+      break;
+
+    case STATE_MOVE_TO_YELLOW:
+      if (driveDistance(150, SEARCH_BASE_SPEED)) {
+        currentState = STATE_CLOSE_FOR_HUNT;
+      }
+      break;
+
+    case STATE_CLOSE_FOR_HUNT:
+      slowServoMove(CLOSE_ANGLE);
+      delay(300);
+      currentState = STATE_SWEEP_YELLOW;
+      break;
+
+    case STATE_SWEEP_YELLOW:
+      set_speed(STOP + SCAN_SPEED, STOP - SCAN_SPEED);
+      if (checkForObject()) {
+        set_speed(STOP, STOP);
+        delay(500);
+        currentState = STATE_APPROACH_YELLOW;
+      } 
+      else if (abs(getEncoderL()) >= TICKS_90_TURN) {
+        set_speed(STOP, STOP);
+        resetEncodersAndTrackHeading();
+        currentState = STATE_TURN_180_CW; 
+      }
+      break;
+
+    case STATE_APPROACH_YELLOW:
+      if (performDifferentialApproach()) {
+        set_speed(STOP, STOP);
+        resetEncodersAndTrackHeading(); 
+        Serial.print("Total heading drift captured: ");
+        Serial.println(globalHeading);
+        currentState = STATE_HALT_ADJUST_YELLOW; // UPDATED TRANSITION
+      }
+      break;
+
+    // --- NEW: 2-DEGREE TWEAK AFTER HUNT 2 ---
+    case STATE_HALT_ADJUST_YELLOW:
+      if (turnInPlace(TICKS_2_DEG, TURN_SPEED, true)) { // true = CW
+        currentState = STATE_PREP_YELLOW_GRIP;
+      }
+      break;
+
+    case STATE_PREP_YELLOW_GRIP:
+      delay(300);
+      slowServoMove(OPEN_ANGLE);
+      delay(500);
+      currentState = STATE_FINAL_INCHES_YELLOW;
+      break;
+
+    case STATE_FINAL_INCHES_YELLOW:
+      if (driveDistance(280, SEARCH_BASE_SPEED)) currentState = STATE_SECURE_YELLOW_CAN;
+      break;
+
+    case STATE_SECURE_YELLOW_CAN:
+      delay(300);
+      slowServoMove(CLOSE_ANGLE);
+      delay(500);
+      resetEncodersAndTrackHeading(); 
+      currentState = STATE_ALIGN_STRAIGHT;
+      break;
+
+    case STATE_ALIGN_STRAIGHT:
+    {
+      bool turnCW = (globalHeading < 0); 
+      long ticksToTurn = abs(globalHeading);
+
+      if (ticksToTurn < 10) {
+        Serial.println("Already straight enough.");
+        resetEncodersAndTrackHeading();
+        currentState = STATE_TURN_180_CW;
+      } 
+      else if (turnInPlace(ticksToTurn, TURN_SPEED, turnCW)) {
+        Serial.println("Robot is now facing straight again.");
+        currentState = STATE_TURN_180_CW;
+      }
+      break;
+    }
+
+    case STATE_TURN_180_CW:
+      if (turnInPlace((TICKS_90_TURN * 2)+15, TURN_SPEED, true)) {
+        Serial.println("180 Degree Turn Complete.");
+        currentState = STATE_DRIVE_TO_WALL;
+      }
+      break;
+
+    case STATE_DRIVE_TO_WALL:
+    {
+      int distL = readSensor(trigLeft, echoLeft);
+      delay(20);
+      int distR = readSensor(trigRight, echoRight);
+      
+      if ((distL > 0 && distL <= WALL_STOP_DIST) || (distR > 0 && distR <= WALL_STOP_DIST)) {
+        set_speed(STOP, STOP);
+        Serial.println("Wall reached at 20cm.");
+        resetEncodersAndTrackHeading(); 
+        currentState = STATE_TURN_180_CW_FINAL;
+      } else {
+        set_speed(STOP + SEARCH_BASE_SPEED, STOP + SEARCH_BASE_SPEED);
+      }
+      break;
+    }
+
+    case STATE_TURN_180_CW_FINAL:
+      if (turnInPlace((TICKS_90_TURN * 2)+15, TURN_SPEED, true)) {
+        Serial.println("Second 180 Degree Turn Complete.");
+        currentState = STATE_REVERSE_FINAL;
+      }
+      break;
+
+    case STATE_REVERSE_FINAL:
+      if (driveDistance(-700, REVERSE_SPEED)) { 
+        Serial.println("Reversed 70cm.");
+        currentState = STATE_FORWARD_10CM;
+      }
+      break;
+
+    case STATE_FORWARD_10CM:
+      if (driveDistance(100, SEARCH_BASE_SPEED)) { 
+        Serial.println("Moved 10cm forward.");
+        currentState = STATE_TURN_90_CCW;
+      }
+      break;
+
+    case STATE_TURN_90_CCW:
+      if (turnInPlace(TICKS_90_TURN, TURN_SPEED, false)) {
+        Serial.println("Turned 90 Degrees Anti-Clockwise.");
+        currentState = STATE_DRIVE_TO_WALL_FINAL;
+      }
+      break;
+
+    case STATE_DRIVE_TO_WALL_FINAL:
+    {
+      int distL = readSensor(trigLeft, echoLeft);
+      delay(20);
+      int distR = readSensor(trigRight, echoRight);
+      
+      if ((distL > 0 && distL <= WALL_STOP_DIST) || (distR > 0 && distR <= WALL_STOP_DIST)) {
+        set_speed(STOP, STOP);
+        Serial.println("Final Wall detected. Moving 10cm closer.");
+        resetEncodersAndTrackHeading(); 
+        currentState = STATE_PUSH_10CM;
+      } else {
+        set_speed(STOP + SEARCH_BASE_SPEED, STOP + SEARCH_BASE_SPEED);
+      }
+      break;
+    }
+
+    case STATE_PUSH_10CM:
+      if (driveDistance(100, SEARCH_BASE_SPEED)) { 
+        Serial.println("Pushed final 10cm.");
+        currentState = STATE_RELEASE_FINAL_CAN;
+      }
+      break;
+
+    case STATE_RELEASE_FINAL_CAN:
+      delay(500);
+      slowServoMove(OPEN_ANGLE);
+      delay(500);
+      resetEncodersAndTrackHeading();
+      currentState = STATE_RETREAT_FINAL;
+      break;
+
+    case STATE_RETREAT_FINAL:
+      if (driveDistance(-150, REVERSE_SPEED)) { 
+        Serial.println("Reversed clear of the can.");
+        currentState = STATE_TURN_90_CW_FINAL;
+      }
+      break;
+
+    case STATE_TURN_90_CW_FINAL:
+      if (turnInPlace(TICKS_90_TURN, TURN_SPEED, true)) {
+        Serial.println("Turned 90 Degrees Clockwise.");
+        currentState = STATE_REVERSE_TO_WALL_FINAL;
+      }
+      break;
+
+    case STATE_REVERSE_TO_WALL_FINAL:
+      if (driveDistance(-700, REVERSE_SPEED)) { 
+        Serial.println("Backed up 70cm against the wall.");
+        currentState = STATE_FORWARD_10CM_FINAL;
+      }
+      break;
+
+    case STATE_FORWARD_10CM_FINAL:
+      if (driveDistance(100, SEARCH_BASE_SPEED)) { 
+        Serial.println("Pulled forward 10cm.");
+        currentState = STATE_TURN_90_CW_AGAIN;
+      }
+      break;
+
+    case STATE_TURN_90_CW_AGAIN:
+      if (turnInPlace(TICKS_90_TURN, TURN_SPEED, true)) {
+        Serial.println("Turned 90 Degrees Clockwise (Final Phase).");
+        currentState = STATE_FORWARD_110CM;
+      }
+      break;
+
+    case STATE_FORWARD_110CM:
+      if (driveDistance(1400, SEARCH_BASE_SPEED)) { 
+        Serial.println("Drove forward 110cm.");
+        currentState = STATE_TURN_90_CCW_AGAIN;
+      }
+      break;
+
+    case STATE_TURN_90_CCW_AGAIN:
+      if (turnInPlace(TICKS_90_TURN, TURN_SPEED, false)) { 
+        Serial.println("Turned 90 Degrees Anti-Clockwise.");
+        currentState = STATE_PREP_FINAL_HUNT;
+      }
+      break;
+
+    case STATE_PREP_FINAL_HUNT:
+      resetEncodersAndClearHeading(); 
+      slowServoMove(CLOSE_ANGLE);
+      delay(300);
+      Serial.println("Ready for final hunt. Sweeping CW...");
+      currentState = STATE_SWEEP_FINAL;
+      break;
+
+    case STATE_SWEEP_FINAL:
+      set_speed(STOP + SCAN_SPEED, STOP - SCAN_SPEED);
+      if (checkForObject()) {
+        set_speed(STOP, STOP);
+        delay(500);
+        currentState = STATE_APPROACH_FINAL;
+      }
+      break;
+
+    case STATE_APPROACH_FINAL:
+      if (performDifferentialApproach()) {
+        set_speed(STOP, STOP);
+        resetEncodersAndTrackHeading(); 
+        Serial.print("Final hunt drift captured: ");
+        Serial.println(globalHeading);
+        currentState = STATE_HALT_ADJUST_FINAL; // UPDATED TRANSITION
+      }
+      break;
+
+    // --- NEW: 2-DEGREE TWEAK AFTER HUNT 3 ---
+    case STATE_HALT_ADJUST_FINAL:
+      if (turnInPlace(TICKS_2_DEG, TURN_SPEED, true)) { // true = CW
+        currentState = STATE_PREP_FINAL_GRIP;
+      }
+      break;
+
+    case STATE_PREP_FINAL_GRIP:
+      delay(300);
+      slowServoMove(OPEN_ANGLE);
+      delay(500);
+      currentState = STATE_FINAL_INCHES_FINAL;
+      break;
+
+    case STATE_FINAL_INCHES_FINAL:
+      if (driveDistance(280, SEARCH_BASE_SPEED)) {
+        currentState = STATE_SECURE_FINAL_CAN;
+      }
+      break;
+
+    case STATE_SECURE_FINAL_CAN:
+      delay(300);
+      slowServoMove(CLOSE_ANGLE);
+      delay(500);
+      resetEncodersAndTrackHeading(); 
+      currentState = STATE_ALIGN_STRAIGHT_FINAL;
+      break;
+
+    case STATE_ALIGN_STRAIGHT_FINAL:
+    {
+      bool turnCW = (globalHeading < 0); 
+      long ticksToTurn = abs(globalHeading);
+
+      if (ticksToTurn < 10) {
+        Serial.println("Already straight enough.");
+        resetEncodersAndTrackHeading();
+        currentState = STATE_FINAL_TURN_90_CCW_1; 
+      } 
+      else if (turnInPlace(ticksToTurn, TURN_SPEED, turnCW)) {
+        Serial.println("Robot is now facing straight again.");
+        currentState = STATE_FINAL_TURN_90_CCW_1; 
+      }
+      break;
+    }
+
+    case STATE_FINAL_TURN_90_CCW_1:
+      if (turnInPlace(TICKS_90_TURN, TURN_SPEED, false)) { 
+        Serial.println("Turned 90 degrees anti-clockwise.");
+        currentState = STATE_FINAL_FORWARD_30CM;
+      }
+      break;
+
+    case STATE_FINAL_FORWARD_30CM:
+      if (driveDistance(500, SEARCH_BASE_SPEED)) { 
+        Serial.println("Drove 30cm forward.");
+        currentState = STATE_FINAL_TURN_90_CCW_2;
+      }
+      break;
+
+    case STATE_FINAL_TURN_90_CCW_2:
+      if (turnInPlace(TICKS_90_TURN, TURN_SPEED, false)) { 
+        Serial.println("Turned 90 degrees anti-clockwise again.");
+        currentState = STATE_FINAL_DRIVE_TO_WALL;
+      }
+      break;
+
+    case STATE_FINAL_DRIVE_TO_WALL:
+    {
+      int distL = readSensor(trigLeft, echoLeft);
+      delay(20);
+      int distR = readSensor(trigRight, echoRight);
+      
+      if ((distL > 0 && distL <= WALL_STOP_DIST) || (distR > 0 && distR <= WALL_STOP_DIST)) {
+        set_speed(STOP, STOP);
+        Serial.println("Wall reached.");
+        resetEncodersAndTrackHeading(); 
+        currentState = STATE_FINAL_TURN_180_2;
+      } else {
+        set_speed(STOP + SEARCH_BASE_SPEED, STOP + SEARCH_BASE_SPEED);
+      }
+      break;
+    }
+
+    case STATE_FINAL_TURN_180_2:
+      if (turnInPlace((TICKS_90_TURN * 2)+15, TURN_SPEED, true)) { 
+        Serial.println("Turned 180 degrees again.");
+        currentState = STATE_FINAL_SQUARE_UP_WALL;
+      }
+      break;
+
+    case STATE_FINAL_SQUARE_UP_WALL:
+      if (driveDistance(-700, REVERSE_SPEED)) { 
+        Serial.println("Reversed 70cm to square up against the wall.");
+        currentState = STATE_FINAL_FORWARD_10CM; 
+      }
+      break;
+
+    case STATE_FINAL_FORWARD_10CM:
+      if (driveDistance(120, SEARCH_BASE_SPEED)) { 
+        Serial.println("Drove 10cm forward.");
+        currentState = STATE_FINAL_TURN_90_CCW;
+      }
+      break;
+
+    case STATE_FINAL_TURN_90_CCW:
+      if (turnInPlace(TICKS_90_TURN, TURN_SPEED, false)) { 
+        Serial.println("Turned 90 degrees CCW.");
+        currentState = STATE_FINAL_DRIVE_TO_DROP_WALL;
+      }
+      break;
+
+    case STATE_FINAL_DRIVE_TO_DROP_WALL:
+    {
+      int distL = readSensor(trigLeft, echoLeft);
+      delay(20);
+      int distR = readSensor(trigRight, echoRight);
+      
+      if ((distL > 0 && distL <= WALL_STOP_DIST) || (distR > 0 && distR <= WALL_STOP_DIST)) {
+        set_speed(STOP, STOP);
+        Serial.println("Drop-off wall reached at 20cm.");
+        resetEncodersAndTrackHeading(); 
+        currentState = STATE_FINAL_PUSH_5CM;
+      } else {
+        set_speed(STOP + SEARCH_BASE_SPEED, STOP + SEARCH_BASE_SPEED);
+      }
+      break;
+    }
+
+    case STATE_FINAL_PUSH_5CM:
+      if (driveDistance(200, SEARCH_BASE_SPEED)) { 
+        Serial.println("Pushed further to position.");
+        currentState = STATE_FINAL_RELEASE_CAN;
+      }
+      break;
+
+    case STATE_FINAL_RELEASE_CAN:
+      delay(500);
+      slowServoMove(OPEN_ANGLE);
+      delay(500);
+      resetEncodersAndTrackHeading();
+      currentState = STATE_FINAL_REVERSE_10CM;
+      break;
+
+    case STATE_FINAL_REVERSE_10CM:
+      if (driveDistance(-100, REVERSE_SPEED)) { 
+        Serial.println("Reversed 10cm away. Mission fully complete!");
+        currentState = STATE_COMPLETE;
+      }
+      break;
+
+    case STATE_COMPLETE:
+      set_speed(STOP, STOP);
+      break;
+  }
+}
+
+// ==========================================
+// 4. HELPER FUNCTIONS
+// ==========================================
+
+void slowServoMove(int targetAngle) {
+  gripperServo.write(targetAngle); 
+  while (gripperServo.moving() > 0) { 
+    checkPause();
+    delay(10); 
+  }
+}
+
+void checkPause() {
+  if (digitalRead(pauseSwitch) == LOW) {
+    set_speed(STOP, STOP); 
+    Serial.println("--- PAUSED ---");
+    while (digitalRead(pauseSwitch) == LOW) {
+      delay(10);
+    }
+    Serial.println("--- RESUMING ---");
+  }
+}
+
+bool driveDistance(long distanceMM, int speed) {
+  long target = abs(distanceMM * TICKS_PER_MM); 
+  if (abs(getEncoderL()) < target) {
+    if (distanceMM > 0) set_speed(STOP + speed, STOP + speed); 
+    else set_speed(STOP - speed, STOP - speed); 
+    return false;
+  } else {
+    set_speed(STOP, STOP); 
+    resetEncodersAndTrackHeading();        
+    return true;  
+  }
+}
+
+bool turnInPlace(long ticks, int speed, bool clockwise) {
+  if (abs(getEncoderL()) < ticks) {
+    if (clockwise) set_speed(STOP + speed, STOP - speed);
+    else set_speed(STOP - speed, STOP + speed);
+    return false;
+  } else {
+    set_speed(STOP, STOP);
+    resetEncodersAndTrackHeading();
+    return true;
+  }
+}
+
+bool checkForObject() {
+  int dL = readSensor(trigLeft, echoLeft); 
+  delay(20);                               
+  int dR = readSensor(trigRight, echoRight); 
+  return ((dL > 2 && dL < SCAN_DIST) || (dR > 2 && dR < SCAN_DIST));
+}
+
+// === FIX APPLIED HERE ===
+bool performDifferentialApproach() {
+  int dL = readSensor(trigLeft, echoLeft);
+  delay(20); 
+  int dR = readSensor(trigRight, echoRight);
+  
+  // Early exit if we are close enough to halt
+  if ((dL > 0 && dL <= HALT_DIST) || (dR > 0 && dR <= HALT_DIST)) return true; 
+
+  int error = dL - dR;  
+  int leftMotor = SEARCH_BASE_SPEED, rightMotor = SEARCH_BASE_SPEED;
+
+  // Use Booleans to cleanly handle the 999 timeout values
+  bool leftDetects = (dL <= SCAN_DIST);
+  bool rightDetects = (dR <= SCAN_DIST);
+
+  if (leftDetects && rightDetects) {
+    // Both see the target: Smooth proportional approach
+    int steeringAdjust = constrain((int)(error * Kp), -MAX_STEER_ADJUST, MAX_STEER_ADJUST);
+    leftMotor += steeringAdjust; 
+    rightMotor -= steeringAdjust;
+    
+  } else if (!leftDetects && rightDetects) {
+    // ONLY right sees the target: Turn right
+    leftMotor = SEARCH_BASE_SPEED + 4; 
+    rightMotor = SEARCH_BASE_SPEED - 6;
+    
+  } else if (leftDetects && !rightDetects) {
+    // ONLY left sees the target: Turn left
+    leftMotor = SEARCH_BASE_SPEED - 6; 
+    rightMotor = SEARCH_BASE_SPEED + 4;
+    
+  } else {
+    // NEITHER sees the target! (It fell into the blind spot)
+    // Inch forward very slowly to try and trigger the HALT_DIST, 
+    // rather than charging forward blindly.
+    leftMotor = 5; 
+    rightMotor = 5; 
+  }
+  
+  set_speed(STOP + leftMotor, STOP + rightMotor);
+  return false; 
+}
+
+int readSensor(int trig, int echo) {
+  digitalWrite(trig, LOW);  delayMicroseconds(2);
+  digitalWrite(trig, HIGH); delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+  long duration = pulseIn(echo, HIGH, 30000);
+  if (duration == 0) return 999;
+  return duration * 0.034 / 2; 
+}
+
+void set_speed(int s1, int s2) {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(SPEED1); Wire.write(constrain(s1, 0, 255)); 
+  Wire.endTransmission();
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(SPEED2); Wire.write(constrain(s2, 0, 255));
+  Wire.endTransmission();
+}
+
+// ==========================================
+// 5. ENCODER TRACKING & MATH
+// ==========================================
+
+long getEncoderL() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(0x02); 
+  Wire.endTransmission();
+  Wire.requestFrom(MD25ADDRESS, 4);
+  if (Wire.available() < 4) return 0; 
+  long pos = (long)Wire.read() << 24;
+  pos |= (long)Wire.read() << 16;
+  pos |= (long)Wire.read() << 8;
+  pos |= (long)Wire.read();
+  return pos;
+}
+
+long getEncoderR() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(0x06); 
+  Wire.endTransmission();
+  Wire.requestFrom(MD25ADDRESS, 4);
+  if (Wire.available() < 4) return 0; 
+  long pos = (long)Wire.read() << 24;
+  pos |= (long)Wire.read() << 16;
+  pos |= (long)Wire.read() << 8;
+  pos |= (long)Wire.read();
+  return pos;
+}
+
+void encoderReset() {
+  Wire.beginTransmission(MD25ADDRESS);
+  Wire.write(RESETENCODERS); Wire.write(0x20); 
+  Wire.endTransmission();
+}
+
+void resetEncodersAndTrackHeading() {
+  long leftPos = getEncoderL();
+  long rightPos = getEncoderR();
+  long headingChange = (leftPos - rightPos) / 2; 
+  globalHeading += headingChange;
+  encoderReset();
+}
+
+void resetEncodersAndClearHeading() {
+  encoderReset();
+  globalHeading = 0;
+}
